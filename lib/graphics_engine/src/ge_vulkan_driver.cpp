@@ -15,6 +15,7 @@
 #include "ge_vulkan_draw_call.hpp"
 #include "ge_vulkan_dynamic_spm_buffer.hpp"
 #include "ge_vulkan_features.hpp"
+#include "ge_vulkan_hiz_depth.hpp"
 #include "ge_vulkan_mesh_cache.hpp"
 #include "ge_vulkan_scene_manager.hpp"
 #include "ge_vulkan_shader_manager.hpp"
@@ -53,7 +54,8 @@ extern "C" VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
     msg += " ";
     msg += callback_data->pMessage;
     if (msg.find("OutputNotConsumed") != std::string::npos ||
-        msg.find("BestPractices-PushConstants") != std::string::npos)
+        msg.find("BestPractices-PushConstants") != std::string::npos ||
+        msg.find("TransitionUndefinedToReadOnly") != std::string::npos)
         return VK_FALSE;
 #ifdef __ANDROID__
     android_LogPriority alp;
@@ -525,6 +527,7 @@ GEVulkanDriver::GEVulkanDriver(const SIrrlichtCreationParameters& params,
 
     m_current_frame = 0;
     m_image_index = 0;
+    m_current_semaphore = 0;
     m_clear_color = video::SColor(0);
     m_rtt_clear_color = m_clear_color;
     m_white_texture = NULL;
@@ -1385,8 +1388,10 @@ void GEVulkanDriver::createSyncObjects()
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-    for (unsigned int i = 0; i < getMaxFrameInFlight(); i++)
+    for (unsigned int i = 0; i < m_vk->swap_chain_images.size(); i++)
     {
+        // Semaphores are per swapchain image
+        // See https://github.com/SaschaWillems/Vulkan/commit/64ba09900257ef0971c8ac0013a5f6448f51a45b
         VkSemaphore image_available_semaphore;
         VkResult result = vkCreateSemaphore(m_vk->device, &semaphore_info, NULL,
             &image_available_semaphore);
@@ -1406,16 +1411,19 @@ void GEVulkanDriver::createSyncObjects()
             throw std::runtime_error(
                 "vkCreateSemaphore on render_finished_semaphore failed");
         }
+        m_vk->image_available_semaphores.push_back(image_available_semaphore);
+        m_vk->render_finished_semaphores.push_back(render_finished_semaphore);
+    }
 
+    for (unsigned int i = 0; i < getMaxFrameInFlight(); i++)
+    {
         VkFence in_flight_fence;
-        result = vkCreateFence(m_vk->device, &fence_info, NULL,
+        VkResult result = vkCreateFence(m_vk->device, &fence_info, NULL,
             &in_flight_fence);
 
         if (result != VK_SUCCESS)
             throw std::runtime_error("vkCreateFence failed");
 
-        m_vk->image_available_semaphores.push_back(image_available_semaphore);
-        m_vk->render_finished_semaphores.push_back(render_finished_semaphore);
         m_vk->in_flight_fences.push_back(in_flight_fence);
     }
 }   // createSyncObjects
@@ -1796,7 +1804,7 @@ bool GEVulkanDriver::endScene()
     vkResetFences(m_vk->device, 1, &fence);
     vkResetCommandPool(m_vk->device, m_vk->command_pools[m_current_frame], 0);
 
-    VkSemaphore semaphore = m_vk->image_available_semaphores[m_current_frame];
+    VkSemaphore semaphore = m_vk->image_available_semaphores[m_current_semaphore];
     VkResult result = vkAcquireNextImageKHR(m_vk->device, m_vk->swap_chain,
         std::numeric_limits<uint64_t>::max(), semaphore, VK_NULL_HANDLE,
         &m_image_index);
@@ -1811,9 +1819,9 @@ bool GEVulkanDriver::endScene()
 
     buildCommandBuffers();
 
-    VkSemaphore wait_semaphores[] = {m_vk->image_available_semaphores[m_current_frame]};
+    VkSemaphore wait_semaphores[] = {m_vk->image_available_semaphores[m_current_semaphore]};
     VkPipelineStageFlags wait_stages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-    VkSemaphore signal_semaphores[] = {m_vk->render_finished_semaphores[m_current_frame]};
+    VkSemaphore signal_semaphores[] = {m_vk->render_finished_semaphores[m_current_semaphore]};
 
     VkSubmitInfo submit_info = {};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1836,7 +1844,7 @@ bool GEVulkanDriver::endScene()
 
     VkSemaphore semaphores[] =
     {
-        m_vk->render_finished_semaphores[m_current_frame]
+        m_vk->render_finished_semaphores[m_current_semaphore]
     };
     VkSwapchainKHR swap_chains[] =
     {
@@ -1854,6 +1862,8 @@ bool GEVulkanDriver::endScene()
     m_current_frame = (m_current_frame + 1) % getMaxFrameInFlight();
     m_current_buffer_idx =
         (m_current_buffer_idx + 1) % (getMaxFrameInFlight() + 1);
+    m_current_semaphore = (m_current_semaphore + 1) %
+        m_vk->swap_chain_images.size();
 
     if (m_present_queue)
         result = vkQueuePresentKHR(m_present_queue, &present_info);
@@ -2602,6 +2612,12 @@ void GEVulkanDriver::renderDrawCalls(
             if (has_displace)
             {
                 vkCmdEndRenderPass(cmd);
+                for (auto& q : p)
+                {
+                    GEVulkanHiZDepth* hiz = q.first->getHiZDepth();
+                    if (hiz)
+                        hiz->generate(cmd);
+                }
                 render_pass_info.clearValueCount = m_rtt_texture
                     ->getZeroClearCountForPass(GVDFP_DISPLACE_MASK);
                 render_pass_info.renderPass = m_rtt_texture
